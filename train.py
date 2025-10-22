@@ -21,6 +21,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from torchvision import transforms
 from torchvision.transforms import functional as TF
+from torchvision.transforms import ToPILImage
 
 from datasets import load_dataset
 import tiktoken
@@ -228,7 +229,9 @@ class VisionQADataset(Dataset):
         row = self.ds[int(idx)]
         img = row['image']
         if not isinstance(img, Image.Image):
-            img = Image.open(img).convert('RGB')
+            img = Image.open(img)
+        # CRITICAL FIX: Always convert to RGB to ensure 3 channels
+        img = img.convert('RGB')
         img = pad_to_square_center(img, IMG_SIZE)
         img = to_tensor(img)
         text = f"Q: {row['prompt']} A: {row['answer']}"
@@ -254,7 +257,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
 if init_from == 'scratch':
     model_args['vocab_size'] = 50304 if not os.path.exists('data/meta.pkl') else pickle.load(open('data/meta.pkl','rb'))['vocab_size']
     gptconf = GPTConfig(**model_args)
-    gpt = GPT(gptconf, ["MLP"] * n_layer)
+    gpt = GPT(gptconf)
 elif init_from == 'resume':
     ckpt = torch.load(os.path.join(out_dir,'ckpt.pt'), map_location='cpu')
     for k in ['n_layer','n_head','n_embd','block_size','bias','vocab_size']:
@@ -263,7 +266,31 @@ elif init_from == 'resume':
     gpt = GPT(gptconf)
     gpt.load_state_dict(ckpt['model'])
 elif init_from.startswith('gpt2'):
-    gpt = GPT.from_pretrained(init_from, override_args=dict(dropout=dropout))
+    print(f"loading weights from pretrained gpt: {init_from}")
+    override_args = dict(dropout=dropout)
+    # CRITICAL FIX: Try-except to handle potential weight loading issues
+    try:
+        gpt = GPT.from_pretrained(init_from, override_args=override_args)
+    except KeyError as e:
+        print(f"WARNING: KeyError during weight loading: {e}")
+        print(f"Falling back to scratch initialization with GPT-2 config")
+        # Fall back to scratch but with GPT-2 architecture
+        if init_from == 'gpt2':
+            model_args.update(dict(n_layer=12, n_head=12, n_embd=768, block_size=1024, 
+                                   bias=True, vocab_size=50257))
+        elif init_from == 'gpt2-medium':
+            model_args.update(dict(n_layer=24, n_head=16, n_embd=1024, block_size=1024,
+                                   bias=True, vocab_size=50257))
+        elif init_from == 'gpt2-large':
+            model_args.update(dict(n_layer=36, n_head=20, n_embd=1280, block_size=1024,
+                                   bias=True, vocab_size=50257))
+        elif init_from == 'gpt2-xl':
+            model_args.update(dict(n_layer=48, n_head=25, n_embd=1600, block_size=1024,
+                                   bias=True, vocab_size=50257))
+        gptconf = GPTConfig(**model_args)
+        gpt = GPT(gptconf)
+        print("Initialized GPT from scratch with GPT-2 architecture")
+    
     for k in ['n_layer','n_head','n_embd','block_size','bias','vocab_size']:
         model_args[k] = getattr(gpt.config,k)
 else:
@@ -303,10 +330,18 @@ optim_groups = [
     {'params': decay_params, 'weight_decay': weight_decay},
     {'params': nodecay_params, 'weight_decay': 0.0},
 ]
+num_decay_params = sum(p.numel() for p in decay_params)
+num_nodecay_params = sum(p.numel() for p in nodecay_params)
+if master_process:
+    print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+    print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
 fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
 use_fused = fused_available and device_type == 'cuda'
 extra_args = dict(fused=True) if use_fused else dict()
 optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(beta1, beta2), **extra_args)
+if master_process:
+    print(f"using fused AdamW: {use_fused}")
 
 # load optimizer if resume
 if init_from == 'resume':
@@ -317,10 +352,11 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # ---------------- data loaders -----------------------------------------------
 train_ds = VisionQADataset(split='train')
-val_ds = VisionQADataset(split='train') if False else VisionQADataset(split='train')  # replace with validation split if available
+val_ds = VisionQADataset(split='train')  # replace with validation split if available
 
+# Reduce num_workers to avoid the warning
 train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                          num_workers=4, pin_memory=True, collate_fn=collate_fn)
+                          num_workers=2, pin_memory=True, collate_fn=collate_fn)
 train_iter = iter(train_loader)
 
 # helper to fetch next batch (loops over epoch automatically)
@@ -363,11 +399,20 @@ def get_lr(it):
     return min_lr + coeff * (learning_rate - min_lr)
 
 # ---------------- training loop (adapted) -----------------------------------
+# Create output directory if it doesn't exist
+os.makedirs(out_dir, exist_ok=True)
+
 iter_num = 0
 best_val_loss = 1e9
 t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
+
+if master_process:
+    print(f"Starting training loop...")
+    print(f"Training for {max_iters} iterations")
+    print(f"Batch size: {batch_size}, Grad accum steps: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {batch_size * gradient_accumulation_steps * ddp_world_size}")
 
 while True:
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -388,6 +433,7 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                print(f"saving checkpoint to {out_dir}")
                 torch.save(ckpt, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
@@ -400,7 +446,6 @@ while True:
             Ximg, Xtok, Y = get_next_batch()
             logits, loss = vlm(Ximg, Xtok, Y)
             loss = loss / gradient_accumulation_steps
-        Ximg, Xtok, Y = get_next_batch()  # prefetch next
         scaler.scale(loss).backward()
 
     if grad_clip != 0.0:
@@ -415,11 +460,40 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5:
             try:
-                mfu = vlm.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
+                mfu = vlm.gpt.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             except Exception:
                 mfu = 0.0
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        
+        # Generate sample output with a random training image
+        if iter_num % 10 == 0:
+            vlm.eval()
+            with torch.no_grad():
+                with ctx:
+                    # Get a random sample from the dataset
+                    sample_idx = torch.randint(0, len(train_ds), (1,)).item()
+                    sample = train_ds[sample_idx]
+                    sample_img = sample['image'].unsqueeze(0).to(device)
+                    
+                    # Save the image for reference
+                    img_path = os.path.join(out_dir, f'sample_iter_{iter_num}.png')
+                    img_pil = ToPILImage()(sample['image'])
+                    img_pil.save(img_path)
+                    
+                    # Generate response (start with empty prompt or just a newline)
+                    prompt = "\n"
+                    prompt_ids = torch.tensor(enc.encode(prompt), dtype=torch.long, device=device).unsqueeze(0)
+                    
+                    # Generate up to 100 tokens
+                    gen_ids = vlm.generate(sample_img, prompt_ids, max_new_tokens=100, temperature=0.8, top_k=200)
+                    gen_text = enc.decode(gen_ids[0].tolist())
+                    
+                    print(f"\n--- Sample Generation (iter {iter_num}) ---")
+                    print(f"Image saved to: {img_path}")
+                    print(f"Generated text: {gen_text}")
+                    print("-------------------------------------------\n")
+            vlm.train()
 
     iter_num += 1
     local_iter_num += 1
