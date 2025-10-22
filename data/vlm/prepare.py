@@ -46,7 +46,10 @@ class VisionQADataset(Dataset):
         # image
         img = sample["image"]
         if not isinstance(img, Image.Image):
-            img = Image.open(img).convert("RGB")
+            img = Image.open(img)
+        
+        # Always convert to RGB to ensure 3 channels
+        img = img.convert("RGB")
         img = img_transform(img)
 
         # text
